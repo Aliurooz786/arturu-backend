@@ -1,6 +1,7 @@
 package com.example.Arturo.service;
 
 import com.example.Arturo.loader.DocumentLoader;
+import com.example.Arturo.model.Chunk;
 import com.example.Arturo.model.SearchResult;
 import com.example.Arturo.util.ChunkingUtil;
 import com.example.Arturo.util.SimilarityUtil;
@@ -10,13 +11,19 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * Core search service implementing the document retrieval pipeline.
+ * Core search service implementing chunk-level semantic retrieval.
  *
- * <p>Pipeline: Load documents → Light clean → Chunk → Full clean → Embed → Similarity → Best match</p>
+ * <p>Pipeline: Load documents → Light clean → Chunk → Full clean → Embed → Similarity → Best chunk</p>
+ *
+ * <p>Unlike document-level search, this service splits every document into logical chunks
+ * (by heading sections) and compares the query against each chunk independently.
+ * This produces more precise matches because embeddings are generated on focused,
+ * topic-specific text rather than entire documents.</p>
  *
  * <p>Orchestrates {@link DocumentLoader} for file access, {@link TextCleaner} for cleaning,
  * {@link ChunkingUtil} for splitting, {@link EmbeddingService} for vector generation,
@@ -44,84 +51,122 @@ public class DocumentService {
         this.embeddingService = embeddingService;
     }
 
+    // ──────────────────────────────────────────────
+    //  CHUNK EXTRACTION
+    // ──────────────────────────────────────────────
+
     /**
-     * Searches the knowledge base for the chunk most similar to the given query.
+     * Loads all documents and splits them into fully cleaned chunks.
      *
-     * <p>For each document: performs light cleaning → chunking → full cleaning per chunk →
-     * embedding → cosine similarity comparison. Returns the single best-matching chunk.</p>
+     * <p>For each document:
+     * <ol>
+     *   <li>Light clean — remove HTML tags, preserve markdown structure</li>
+     *   <li>Chunk — split by heading markers ({@code ##})</li>
+     *   <li>Full clean — strip all remaining markdown from each chunk</li>
+     * </ol>
+     * Each returned {@link Chunk} carries its source {@code docId} and cleaned text content.</p>
      *
-     * @param query the user's search query
-     * @return {@link SearchResult} with the best match, or {@code null} if no documents are found
+     * @return list of all chunks across all documents; empty list if no documents found
      */
-    public SearchResult searchBestMatch(String query) {
-        // Step 1: Load all documents from the knowledge base
+    public List<Chunk> getAllChunks() {
         Map<String, String> documents = documentLoader.loadDocuments(knowledgeBasePath);
 
         if (documents.isEmpty()) {
             log.warn("No documents found in knowledge-base: {}", knowledgeBasePath);
-            return null;
+            return List.of();
         }
 
-        log.info("Loaded {} documents. Starting search for query: \"{}\"", documents.size(), query);
+        List<Chunk> allChunks = new ArrayList<>();
 
-        // Step 2: Generate the query embedding once (reused against all chunks)
-        List<Double> queryEmbedding = embeddingService.generateEmbedding(query);
-        log.debug("Query embedding generated (dimension: {})", queryEmbedding.size());
-
-        String bestDocId = null;
-        String bestChunkPreview = null;
-        double bestScore = -1;
-
-        // Step 3: Process each document through the pipeline
         for (Map.Entry<String, String> entry : documents.entrySet()) {
             String docId = entry.getKey();
             String rawContent = entry.getValue();
 
-            // Light clean: remove HTML but preserve markdown structure for chunking
+            // Step 1: Light clean — remove HTML but keep markdown headings for chunking
             String lightlyCleaned = TextCleaner.removeHtml(rawContent);
 
-            // Chunk: split into sections by heading markers
-            List<String> chunks = ChunkingUtil.splitIntoChunks(lightlyCleaned);
-            log.debug("Document '{}': split into {} chunks", docId, chunks.size());
+            // Step 2: Split into sections by heading markers
+            List<String> rawChunks = ChunkingUtil.splitIntoChunks(lightlyCleaned);
 
-            // Score each chunk independently
-            for (int i = 0; i < chunks.size(); i++) {
-                // Full clean: strip all markdown formatting from this chunk
-                String cleaned = TextCleaner.clean(chunks.get(i));
-                String trimmed = truncate(cleaned, MAX_EMBED_LENGTH);
-
-                // Generate embedding and compute similarity
-                List<Double> chunkEmbedding = embeddingService.generateEmbedding(trimmed);
-                double score = SimilarityUtil.cosineSimilarity(queryEmbedding, chunkEmbedding);
-
-                log.debug("  {}[chunk-{}] → similarity: {}", docId, i, String.format("%.4f", score));
-
-                if (score > bestScore) {
-                    bestScore = score;
-                    bestDocId = docId;
-                    bestChunkPreview = cleaned;
+            // Step 3: Full clean each chunk and wrap in Chunk model
+            for (String rawChunk : rawChunks) {
+                String cleaned = TextCleaner.clean(rawChunk);
+                if (!cleaned.isBlank()) {
+                    allChunks.add(new Chunk(docId, cleaned));
                 }
+            }
+
+            log.info("Document '{}': extracted {} chunks", docId, rawChunks.size());
+        }
+
+        log.info("Total chunks extracted across all documents: {}", allChunks.size());
+        return allChunks;
+    }
+
+    // ──────────────────────────────────────────────
+    //  CHUNK-LEVEL SEARCH
+    // ──────────────────────────────────────────────
+
+    /**
+     * Searches all chunks in the knowledge base and returns the one most similar to the query.
+     *
+     * <p>Flow:
+     * <ol>
+     *   <li>Extract all chunks via {@link #getAllChunks()}</li>
+     *   <li>Generate query embedding once</li>
+     *   <li>For each chunk: truncate → embed → compute cosine similarity</li>
+     *   <li>Track and return the highest-scoring chunk</li>
+     * </ol></p>
+     *
+     * @param query the user's search query
+     * @return {@link SearchResult} with the best-matching chunk, or {@code null} if no chunks exist
+     */
+    public SearchResult searchBestChunk(String query) {
+        // Step 1: Extract all cleaned chunks from all documents
+        List<Chunk> chunks = getAllChunks();
+
+        if (chunks.isEmpty()) {
+            log.warn("No chunks available for search");
+            return null;
+        }
+
+        // Step 2: Generate query embedding (reused against every chunk)
+        log.info("Starting chunk search for query: \"{}\"", query);
+        List<Double> queryEmbedding = embeddingService.generateEmbedding(query);
+        log.debug("Query embedding generated (dimension: {})", queryEmbedding.size());
+
+        // Step 3: Compare query against each chunk and track the best match
+        Chunk bestChunk = null;
+        double bestScore = -1;
+
+        for (int i = 0; i < chunks.size(); i++) {
+            Chunk chunk = chunks.get(i);
+            String trimmed = truncate(chunk.getContent(), MAX_EMBED_LENGTH);
+
+            List<Double> chunkEmbedding = embeddingService.generateEmbedding(trimmed);
+            double score = SimilarityUtil.cosineSimilarity(queryEmbedding, chunkEmbedding);
+
+            log.debug("  [{}][chunk-{}] → similarity: {}", chunk.getDocId(), i, String.format("%.4f", score));
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestChunk = chunk;
             }
         }
 
-        String preview = truncate(bestChunkPreview, MAX_PREVIEW_LENGTH);
-        log.info("Best match: '{}' (score: {})", bestDocId, String.format("%.4f", bestScore));
+        // Step 4: Build and return the result
+        String preview = truncate(bestChunk.getContent(), MAX_PREVIEW_LENGTH);
+        log.info("Best chunk match: '{}' (score: {})", bestChunk.getDocId(), String.format("%.4f", bestScore));
 
-        return new SearchResult(bestDocId, bestScore, preview);
+        return new SearchResult(bestChunk.getDocId(), bestScore, preview);
     }
 
-    /**
-     * Loads all documents from the knowledge base.
-     * Primarily used by controller endpoints that need raw document access.
-     *
-     * @return map of document ID (filename without extension) → raw content
-     */
-    public Map<String, String> getDocuments() {
-        return documentLoader.loadDocuments(knowledgeBasePath);
-    }
+    // ──────────────────────────────────────────────
+    //  HELPERS
+    // ──────────────────────────────────────────────
 
     /**
-     * Truncates text to the specified maximum length without breaking mid-word.
+     * Truncates text to the specified maximum length.
      *
      * @param text      the text to truncate
      * @param maxLength maximum allowed length

@@ -22,19 +22,22 @@ public class DocumentController {
     }
 
     /**
-     * Searches the knowledge base and returns the most relevant document chunk.
+     * Searches the knowledge base and returns the most relevant chunk.
+     *
+     * <p>Performs chunk-level semantic search: each document is split into sections,
+     * and the query is compared against every chunk individually for precise matching.</p>
      *
      * <p>Currently uses a fixed query for MVP. To accept user input, add
      * {@code @RequestParam String query} as a parameter — a one-line change.</p>
      *
      * @return JSON response with {@code docId}, {@code score}, and {@code contentPreview},
-     *         or HTTP 204 No Content if no documents are found
+     *         or HTTP 204 No Content if no chunks are found
      */
     @GetMapping("/search")
     public ResponseEntity<SearchResult> search() {
         String query = "ucm draft kibana error";
 
-        SearchResult result = documentService.searchBestMatch(query);
+        SearchResult result = documentService.searchBestChunk(query);
 
         if (result == null) {
             return ResponseEntity.noContent().build();
