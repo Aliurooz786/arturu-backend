@@ -2,6 +2,7 @@ package com.example.Arturo.service;
 
 import com.example.Arturo.loader.DocumentLoader;
 import com.example.Arturo.model.SearchResult;
+import com.example.Arturo.util.ChunkingUtil;
 import com.example.Arturo.util.SimilarityUtil;
 import com.example.Arturo.util.TextCleaner;
 import org.slf4j.Logger;
@@ -13,18 +14,23 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Core service for document search.
- * Loads documents, generates embeddings, computes similarity, and returns the best match.
+ * Core search service implementing the document retrieval pipeline.
+ *
+ * <p>Pipeline: Load documents → Light clean → Chunk → Full clean → Embed → Similarity → Best match</p>
+ *
+ * <p>Orchestrates {@link DocumentLoader} for file access, {@link TextCleaner} for cleaning,
+ * {@link ChunkingUtil} for splitting, {@link EmbeddingService} for vector generation,
+ * and {@link SimilarityUtil} for scoring.</p>
  */
 @Service
 public class DocumentService {
 
     private static final Logger log = LoggerFactory.getLogger(DocumentService.class);
 
-    /** Maximum characters to embed per document (keeps embedding calls fast). */
+    /** Maximum characters to send per chunk for embedding (keeps API calls efficient). */
     private static final int MAX_EMBED_LENGTH = 500;
 
-    /** Maximum characters for the content preview in the response. */
+    /** Maximum characters for the content preview in the search response. */
     private static final int MAX_PREVIEW_LENGTH = 500;
 
     private final DocumentLoader documentLoader;
@@ -39,12 +45,16 @@ public class DocumentService {
     }
 
     /**
-     * Searches the knowledge base for the document most similar to the given query.
+     * Searches the knowledge base for the chunk most similar to the given query.
      *
-     * @param query the search query text
-     * @return SearchResult containing the best match, or null if no documents found
+     * <p>For each document: performs light cleaning → chunking → full cleaning per chunk →
+     * embedding → cosine similarity comparison. Returns the single best-matching chunk.</p>
+     *
+     * @param query the user's search query
+     * @return {@link SearchResult} with the best match, or {@code null} if no documents are found
      */
     public SearchResult searchBestMatch(String query) {
+        // Step 1: Load all documents from the knowledge base
         Map<String, String> documents = documentLoader.loadDocuments(knowledgeBasePath);
 
         if (documents.isEmpty()) {
@@ -52,43 +62,74 @@ public class DocumentService {
             return null;
         }
 
+        log.info("Loaded {} documents. Starting search for query: \"{}\"", documents.size(), query);
+
+        // Step 2: Generate the query embedding once (reused against all chunks)
         List<Double> queryEmbedding = embeddingService.generateEmbedding(query);
+        log.debug("Query embedding generated (dimension: {})", queryEmbedding.size());
 
         String bestDocId = null;
-        String bestCleanedContent = null;
+        String bestChunkPreview = null;
         double bestScore = -1;
 
+        // Step 3: Process each document through the pipeline
         for (Map.Entry<String, String> entry : documents.entrySet()) {
             String docId = entry.getKey();
             String rawContent = entry.getValue();
 
-            // Clean text before embedding to remove noise
-            String cleaned = TextCleaner.clean(rawContent);
-            String trimmed = truncate(cleaned, MAX_EMBED_LENGTH);
+            // Light clean: remove HTML but preserve markdown structure for chunking
+            String lightlyCleaned = TextCleaner.removeHtml(rawContent);
 
-            List<Double> docEmbedding = embeddingService.generateEmbedding(trimmed);
-            double score = SimilarityUtil.cosineSimilarity(queryEmbedding, docEmbedding);
+            // Chunk: split into sections by heading markers
+            List<String> chunks = ChunkingUtil.splitIntoChunks(lightlyCleaned);
+            log.debug("Document '{}': split into {} chunks", docId, chunks.size());
 
-            log.debug("{} → similarity: {}", docId, score);
+            // Score each chunk independently
+            for (int i = 0; i < chunks.size(); i++) {
+                // Full clean: strip all markdown formatting from this chunk
+                String cleaned = TextCleaner.clean(chunks.get(i));
+                String trimmed = truncate(cleaned, MAX_EMBED_LENGTH);
 
-            if (score > bestScore) {
-                bestScore = score;
-                bestDocId = docId;
-                bestCleanedContent = cleaned;
+                // Generate embedding and compute similarity
+                List<Double> chunkEmbedding = embeddingService.generateEmbedding(trimmed);
+                double score = SimilarityUtil.cosineSimilarity(queryEmbedding, chunkEmbedding);
+
+                log.debug("  {}[chunk-{}] → similarity: {}", docId, i, String.format("%.4f", score));
+
+                if (score > bestScore) {
+                    bestScore = score;
+                    bestDocId = docId;
+                    bestChunkPreview = cleaned;
+                }
             }
         }
 
-        String preview = truncate(bestCleanedContent, MAX_PREVIEW_LENGTH);
-        log.info("Best match: {} (score: {})", bestDocId, bestScore);
+        String preview = truncate(bestChunkPreview, MAX_PREVIEW_LENGTH);
+        log.info("Best match: '{}' (score: {})", bestDocId, String.format("%.4f", bestScore));
 
         return new SearchResult(bestDocId, bestScore, preview);
     }
 
     /**
-     * Truncates text to the given maximum length.
+     * Loads all documents from the knowledge base.
+     * Primarily used by controller endpoints that need raw document access.
+     *
+     * @return map of document ID (filename without extension) → raw content
+     */
+    public Map<String, String> getDocuments() {
+        return documentLoader.loadDocuments(knowledgeBasePath);
+    }
+
+    /**
+     * Truncates text to the specified maximum length without breaking mid-word.
+     *
+     * @param text      the text to truncate
+     * @param maxLength maximum allowed length
+     * @return truncated text, or empty string if input is null
      */
     private String truncate(String text, int maxLength) {
         if (text == null) return "";
-        return text.substring(0, Math.min(text.length(), maxLength));
+        if (text.length() <= maxLength) return text;
+        return text.substring(0, maxLength);
     }
 }

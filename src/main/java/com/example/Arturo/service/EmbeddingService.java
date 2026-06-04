@@ -14,14 +14,21 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Calls the Ollama embedding API to generate vector embeddings for text.
+ * Service for generating vector embeddings via the Ollama API.
+ *
+ * <p>Calls the configured Ollama endpoint with the {@code nomic-embed-text} model
+ * (or whichever model is set in {@code application.properties}) and returns
+ * the resulting embedding vector as a list of doubles.</p>
  */
 @Service
 public class EmbeddingService {
 
     private static final Logger log = LoggerFactory.getLogger(EmbeddingService.class);
 
+    /** Reusable JSON mapper — thread-safe, no need to recreate per call. */
     private final ObjectMapper mapper = new ObjectMapper();
+
+    /** Reusable HTTP client — thread-safe, connection-pooled internally. */
     private final HttpClient httpClient = HttpClient.newHttpClient();
 
     @Value("${ollama.api.url}")
@@ -31,10 +38,11 @@ public class EmbeddingService {
     private String ollamaModel;
 
     /**
-     * Generates a vector embedding for the given text using the Ollama API.
+     * Generates a vector embedding for the given text by calling the Ollama API.
      *
-     * @param text the input text to embed
-     * @return list of doubles representing the embedding vector
+     * @param text the input text to embed (should be pre-cleaned)
+     * @return embedding vector as a list of doubles
+     * @throws RuntimeException if the API call fails or the response cannot be parsed
      */
     public List<Double> generateEmbedding(String text) {
         try {
@@ -57,10 +65,15 @@ public class EmbeddingService {
 
             @SuppressWarnings("unchecked")
             List<Double> embedding = (List<Double>) result.get("embedding");
+
+            log.debug("Embedding generated (dimension: {}) for text: \"{}...\"",
+                    embedding.size(), text.substring(0, Math.min(40, text.length())));
+
             return embedding;
 
         } catch (Exception e) {
-            log.error("Embedding generation failed for text: {}...", text.substring(0, Math.min(50, text.length())), e);
+            log.error("Embedding generation failed for text: \"{}...\"",
+                    text.substring(0, Math.min(50, text.length())), e);
             throw new RuntimeException("Embedding generation failed", e);
         }
     }
